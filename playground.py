@@ -142,16 +142,18 @@ IGNORE_Y = int(0.75 * h)
 # SENSOR RAYS
 # =====================================================
 
-origin = (w // 2, int(0.88 * h))
+origin = (w // 2, int(0.35 * h))
 ray_length = int(0.65 * h)
 
-angles = {"left": 12, "center": 0, "right": -12}
+angles = {"far_left": 120, "left": 168, "center": 180, "right": -168, "far_right": -120}
 
-# Urgency weighting per ray (side rays deprioritized)
+# Urgency weighting per ray
 RAY_URGENCY_WEIGHT = {
-    "left": 0.25,
+    "left": 0.15,
     "center": 1.0,
-    "right": 0.25
+    "right": 0.15,
+    "far_left": 0.05,
+    "far_right": 0.05
 }
 
 # =====================================================
