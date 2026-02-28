@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import torchvision
+import sys
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.transforms import functional as F
 
@@ -13,7 +14,27 @@ from torchvision.transforms import functional as F
 # =====================================================
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-video_path = os.path.join(script_dir, "video2.mp4")
+DEFAULT_VIDEO = "ads.mp4"
+MAX_VIDEO_SIZE_MB = 25
+
+if len(sys.argv) > 1:
+    input_path = sys.argv[1]
+    video_path = input_path if os.path.isabs(input_path) else os.path.join(script_dir, input_path)
+else:
+    video_path = os.path.join(script_dir, DEFAULT_VIDEO)
+
+if not os.path.exists(video_path):
+    raise FileNotFoundError(f"Video file not found: {video_path}")
+
+video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+if video_size_mb > MAX_VIDEO_SIZE_MB:
+    raise ValueError(
+        f"Video is too large ({video_size_mb:.2f} MB). "
+        f"Max supported size is {MAX_VIDEO_SIZE_MB} MB."
+    )
+
+print(f"Loading video: {video_path}")
+print(f"Video size: {video_size_mb:.2f} MB (max {MAX_VIDEO_SIZE_MB} MB)")
 
 # Load Faster R-CNN model
 print("Loading Faster R-CNN ResNet50-FPN model...")
@@ -23,6 +44,10 @@ print(f"Using device: {device}")
 model = fasterrcnn_resnet50_fpn(pretrained=True)
 model.to(device)
 model.eval()
+model.roi_heads.detections_per_img = 50
+
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 print("Model loaded successfully")
 
 # COCO class names (Faster R-CNN uses COCO dataset classes)
@@ -43,9 +68,15 @@ COCO_CLASSES = [
 
 cap = cv2.VideoCapture(video_path)
 
+if not cap.isOpened():
+    raise RuntimeError(f"OpenCV could not open video: {video_path}")
+
 fps = cap.get(cv2.CAP_PROP_FPS)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+if fps <= 0:
+    fps = 30.0
 
 # =====================================================
 # DRIVING INTERPRETER
@@ -132,8 +163,9 @@ class DrivingInterpreter:
         self.speed += speed_alpha * (desired - self.speed)
         self.speed = max(0.0, self.speed)
 
-        # FIX: only enforce min speed when there is truly no obstacle nearby
-        if prox_factor < 0.15:
+        # Keep rolling at low speed for ray-based braking unless we are truly too close
+        # or a traffic control requires a stop.
+        if (not red_light_stop) and (not stop_sign_stop) and (prox_factor < CLOSE_PROXIMITY):
             dynamic_min = MIN_SPEED_NO_STOP
             if self.speed < dynamic_min and self.speed > 0.1:
                 self.speed = dynamic_min
@@ -183,12 +215,14 @@ angles = {
 }
 
 RAY_URGENCY_WEIGHT = {
-    "left":      0.15,
+    "left":      0.015,
     "center":    1.0,
-    "right":     0.15,
-    "far_left":  0.005,
-    "far_right": 0.005,
+    "right":     0.015,
+    "far_left":  0.00005,
+    "far_right": 0.00005,
 }
+
+STOP_PROX_RAYS = {"left", "center", "right"}
 
 def make_ray(angle):
     r = math.radians(angle)
@@ -313,23 +347,57 @@ ROAD_CLEAR_PROX_THRESHOLD = 0.12
 stop_sign_hold_until = 0.0
 stop_sign_waiting_clear = False
 stop_sign_armed = True
+exit_requested = False
+
+# Inference speed tuning
+INFER_SCALE = 0.75
+INFER_EVERY_N_FRAMES = 2
+CONF_THRESHOLD = 0.35
+frame_count = 0
+last_predictions = None
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
+    frame_count += 1
+
     now       = time.time()
     dt        = now - prev_time
     prev_time = now
 
-    # Run Faster R-CNN inference
-    # Convert BGR to RGB and then to tensor
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    input_tensor = F.to_tensor(rgb_frame).to(device)
-    
-    with torch.no_grad():
-        predictions = model([input_tensor])[0]
+    # Run Faster R-CNN inference (downscaled + optional frame skipping)
+    run_inference = (last_predictions is None) or (frame_count % INFER_EVERY_N_FRAMES == 1)
+    if run_inference:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if INFER_SCALE != 1.0:
+            infer_rgb = cv2.resize(
+                rgb_frame,
+                None,
+                fx=INFER_SCALE,
+                fy=INFER_SCALE,
+                interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            infer_rgb = rgb_frame
+
+        input_tensor = F.to_tensor(infer_rgb).to(device)
+
+        with torch.inference_mode():
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred = model([input_tensor])[0]
+            else:
+                pred = model([input_tensor])[0]
+
+        if INFER_SCALE != 1.0:
+            scale_back = 1.0 / INFER_SCALE
+            pred["boxes"] = pred["boxes"] * scale_back
+
+        last_predictions = pred
+
+    predictions = last_predictions
 
     pedestrians       = []
     objects           = []
@@ -350,10 +418,10 @@ while cap.isOpened():
     scores = predictions['scores'].cpu().numpy()
 
     # Filter by confidence threshold
-    conf_threshold = 0.35
+    conf_threshold = CONF_THRESHOLD
     for box, label_id, score in zip(boxes, labels, scores):
         if score < conf_threshold:
-            continue
+            break
 
         x1, y1, x2, y2 = map(int, box)
         cx = (x1 + x2) // 2
@@ -505,7 +573,8 @@ while cap.isOpened():
 
         weighted = ray_urgency * RAY_URGENCY_WEIGHT[name]
         max_urgency   = max(max_urgency,  weighted)
-        max_proximity = max(max_proximity, ray_urgency)
+        if name in STOP_PROX_RAYS:
+            max_proximity = max(max_proximity, ray_urgency)
 
         ray_results[name] = (hit, ray_urgency)
 
@@ -576,6 +645,29 @@ while cap.isOpened():
         break
     elif key == ord("b"):
         show_boxes = not show_boxes
+    elif key == ord(" "):
+        paused = True
+        while paused:
+            paused_frame = frame.copy()
+            cv2.putText(
+                paused_frame,
+                "PAUSED - Press SPACE to resume",
+                (40, h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
+            cv2.imshow("ridesight rcnn", paused_frame)
+            pause_key = cv2.waitKey(30) & 0xFF
+            if pause_key == ord(" "):
+                paused = False
+                prev_time = time.time()
+            elif pause_key == ord("q"):
+                paused = False
+                exit_requested = True
+        if exit_requested:
+            break
 
 cap.release()
 cv2.destroyAllWindows()
